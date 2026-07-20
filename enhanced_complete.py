@@ -34,6 +34,10 @@ import threading
 import requests
 import idna
 import concurrent.futures
+import contextlib
+import aiohttp
+import dns.resolver
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple, Optional, Any, Set, Union, Callable, Awaitable
 from collections import Counter, defaultdict, OrderedDict, deque
@@ -42,6 +46,8 @@ from functools import lru_cache, wraps, partial
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from weakref import WeakValueDictionary
+from urllib3.util import Retry
+from requests.adapters import HTTPAdapter
 import logging
 import signal
 import uuid
@@ -2880,7 +2886,7 @@ class WebsiteSecurityAnalyzer:
     def _create_empty_result(self, host: str, port: int) -> Dict:
         return {
             'host': host, 'port': port, 'engine_version': self.ENGINE_VERSION,
-            'ssl_valid': False, 'negotiated_tls_version': 'unknown', 'supports_tls13': False,
+            'ssl_valid': None, 'negotiated_tls_version': 'unknown', 'supports_tls13': None,
             'cipher_suite': None, 'perfect_forward_secrecy': False, 'tls_compression': False,
             'alpn_protocol': None, 'supports_http2': False, 'signature_algorithm': None,
             'weak_signature': False, 'key_size': None, 'weak_key': False, 'ssl_issuer': None,
@@ -3027,7 +3033,7 @@ class WebsiteSecurityAnalyzer:
             return {
                 'host': host, 'port': port, 'scheme': scheme, 'ssl_valid': False,
                 'supports_https': scheme == 'https', 'https_working': False,
-                'error_category': failure_reason.value, '_source': 'endpoint_error',
+                '_source': error_category,
                 '_failure_reason': failure_reason.value, 'trust_score': 0,
                 'scan_duration': (time.perf_counter() - start_time) * 1000,
             }
@@ -3133,389 +3139,549 @@ class WebsiteSecurityAnalyzer:
             return result, False
 
     async def _perform_analysis(self, host: str, port: int, scheme: str = "https", profile: Optional['RequestProfile'] = None) -> Dict:
-        start_time = time.perf_counter()
-        network_errors = []
-
-        result = self._create_empty_result(host, port)
-        result['scheme'] = scheme
-
-        headers_override = {}
-        if profile:
-            headers_override = profile.headers.copy()
-            result['_profile_used'] = profile.name
-
-        trust_score = 0
-        response = None
-        http_response = None
-
-        try:
-            if scheme == "https":
-                if port == 443:
-                    url_main = f"https://{host}"
-                else:
-                    url_main = f"https://{host}:{port}"
-                url_http = f"http://{host}" if port == 443 else f"http://{host}:{port}"
-            else:
-                if port == 80:
-                    url_main = f"http://{host}"
-                else:
-                    url_main = f"http://{host}:{port}"
-                url_http = url_main
-
-            result['supports_https'] = (scheme == "https")
-            result['https_working'] = False
-
-            # HTTP → HTTPS Redirect
-            if scheme == "https":
-                try:
-                    http_response = await self._request("get", url_http, timeout=self.REQUEST_TIMEOUT, allow_redirects=False, headers=headers_override or None)
-                    result['supports_http'] = True
-                    if http_response.status_code in (301, 302, 307, 308):
-                        location = http_response.headers.get('Location', '')
-                        if 'https' in location.lower():
-                            result['http_redirects_to_https'] = True
-                except Exception as e:
-                    self._logger.debug(f"HTTP redirect check failed for {host}: {e}")
-                    network_errors.append(f"http_redirect: {str(e)}")
-                finally:
-                    if http_response:
-                        self._close_response(http_response)
-
-                if http_response and http_response.status_code == 200:
-                    result['https_only'] = False
-                else:
-                    result['https_only'] = result['http_redirects_to_https']
-
-            # Main Request
-            try:
-                response = await self._request("get", url_main, timeout=self.REQUEST_TIMEOUT, verify=True, allow_redirects=True, headers=headers_override or None)
-
-                if scheme == "https":
-                    result['https_working'] = True
-                result['supports_http'] = result['supports_http'] or (scheme == "http")
-                result['final_url'] = response.url
-                result['redirect_count'] = len(response.history)
-
-                result['server_header'] = response.headers.get('server')
-                result['powered_by'] = response.headers.get('x-powered-by')
-
-                # HSTS
-                if scheme == "https":
-                    hsts = response.headers.get('strict-transport-security', '')
-                    if not hsts and hasattr(response, 'history') and response.history:
-                        for past_response in response.history:
-                            hsts = past_response.headers.get('strict-transport-security', '')
-                            if hsts:
-                                break
-
-                    result['hsts_enabled'] = bool(hsts)
-                    result['hsts_long_max_age'] = 'max-age=31536000' in hsts if hsts else False
-                    result['hsts_preload'] = 'preload' in hsts.lower() if hsts else False
-
-                # Security Headers
-                all_headers = {}
-                for key, value in response.headers.items():
-                    all_headers[key.lower()] = value
-
-                if hasattr(response, 'history') and response.history:
-                    for past_response in response.history:
-                        for key, value in past_response.headers.items():
-                            if key.lower() not in all_headers:
-                                all_headers[key.lower()] = value
-
-                for header in self.SECURITY_HEADERS_LIST:
-                    result['security_headers'][header] = header in all_headers
-
-                xfo = all_headers.get("x-frame-options", "").lower()
-                result['xfo_strong'] = xfo in ["deny", "sameorigin"]
-
-                csp = all_headers.get("content-security-policy", "").lower()
-                result['csp_unsafe_inline'] = "unsafe-inline" in csp
-                result['csp_unsafe_eval'] = "unsafe-eval" in csp
-                result['csp_wildcard'] = "*" in csp
-
-                result['ocsp_possible'] = 'ocsp' in all_headers.get('server', '').lower()
-
-                # Mixed Content
-                try:
-                    response.raw.decode_content = True
-                    content_chunk = response.raw.read(50000, decode_content=True)
-                    content = content_chunk.decode(errors="ignore")
-                    if re.search(r'src=["\\\']http://|href=["\\\']http://', content, re.I):
-                        result['mixed_content_possible'] = True
-                except:
-                    pass
-
-                if csp and "upgrade-insecure-requests" not in csp and "block-all-mixed-content" not in csp:
-                    result['mixed_content_possible'] = True
-
-                # SSL Certificate Analysis
-                if scheme == "https" and hasattr(response, 'raw') and hasattr(response.raw, '_connection'):
-                    sock = response.raw._connection.sock
-                    if hasattr(sock, 'getpeercert'):
-                        cert = sock.getpeercert()
-                        leaf_der = sock.getpeercert(True)
-
-                        result['ssl_valid'] = True
-                        result['https_working'] = True
-
-                        try:
-                            tls_version = sock.version()
-                            result['negotiated_tls_version'] = tls_version
-                            weak_tls = ['TLSv1', 'TLSv1.1']
-                            result['weak_tls'] = tls_version in weak_tls
-                            result['supports_tls13'] = tls_version == 'TLSv1.3'
-                        except:
-                            pass
-
-                        try:
-                            cipher = sock.cipher()
-                            if cipher:
-                                result['cipher_suite'] = cipher[0]
-                                pfs_keywords = ['ECDHE', 'DHE']
-                                result['perfect_forward_secrecy'] = any(k in result['cipher_suite'] for k in pfs_keywords)
-                                if 'RC4' in result['cipher_suite']:
-                                    result['weak_tls'] = True
-                        except:
-                            pass
-
-                        try:
-                            if hasattr(sock, "compression"):
-                                result['tls_compression'] = sock.compression() is not None
-                        except:
-                            pass
-
-                        try:
-                            if hasattr(sock, "selected_alpn_protocol"):
-                                result['alpn_protocol'] = sock.selected_alpn_protocol()
-                                result['supports_http2'] = result['alpn_protocol'] == "h2"
-                        except:
-                            pass
-
-                        try:
-                            if hasattr(sock, "ocsp_response"):
-                                result['ocsp_stapling'] = sock.ocsp_response is not None
-                        except:
-                            pass
-
-                        if leaf_der:
-                            try:
-                                cert_obj = x509.load_der_x509_certificate(leaf_der, default_backend())
-                                sig_algo = cert_obj.signature_hash_algorithm.name
-                                result['signature_algorithm'] = sig_algo
-                                if sig_algo in ["sha1", "md5"]:
-                                    result['weak_signature'] = True
-
-                                pub_key = cert_obj.public_key()
-                                if hasattr(pub_key, "key_size"):
-                                    result['key_size'] = pub_key.key_size
-                                    if pub_key.key_size < 2048:
-                                        result['weak_key'] = True
-
-                                try:
-                                    cert_obj.extensions.get_extension_for_oid(x509.OID_SIGNED_CERTIFICATE_TIMESTAMPS)
-                                    result['certificate_transparency'] = True
-                                except:
-                                    result['certificate_transparency'] = False
-
-                                try:
-                                    aia = cert_obj.extensions.get_extension_for_class(x509.AuthorityInformationAccess)
-                                    result['has_ocsp_url'] = any('OCSP' in str(x) for x in aia.value)
-                                except:
-                                    result['has_ocsp_url'] = False
-                            except Exception as e:
-                                self._logger.debug(f"Cert parsing error for {host}: {e}")
-
-                        if cert:
-                            issuer = dict(x[0] for x in cert.get('issuer', []))
-                            issuer_name = issuer.get('organizationName', issuer.get('commonName', 'Unknown'))
-                            result['ssl_issuer'] = issuer_name
-
-                            if issuer_name and issuer_name != 'Unknown':
-                                issuer_lower = issuer_name.lower()
-                                result['trusted_ca'] = any(ca in issuer_lower for ca in self.KNOWN_TRUSTED_CAS)
-
-                            result['cert_chain_complete'] = result['trusted_ca']
-
-                            subject = dict(x[0] for x in cert.get('subject', []))
-                            subject_name = subject.get('commonName', 'Unknown')
-                            result['ssl_subject'] = subject_name
-
-                            if subject_name and '*' in subject_name:
-                                result['is_wildcard_cert'] = True
-
-                            san_list = cert.get('subjectAltName', [])
-                            result['subject_alt_names'] = san_list
-                            result['has_san'] = len(san_list) > 0
-
-                            hostname_match = False
-                            if subject_name and subject_name != 'Unknown':
-                                if self._match_hostname(host.lower(), subject_name.lower()):
-                                    hostname_match = True
-
-                            for san in san_list:
-                                if isinstance(san, tuple) and len(san) >= 2:
-                                    san_value = san[1].lower()
-                                    if self._match_hostname(host.lower(), san_value):
-                                        hostname_match = True
-                                        break
-
-                            result['hostname_mismatch'] = not hostname_match
-
-                            not_after = cert.get('notAfter')
-                            if not_after:
-                                expiry = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z')
-                                expiry = expiry.replace(tzinfo=timezone.utc)
-                                result['ssl_expiry'] = expiry.strftime('%Y-%m-%d')
-                                result['ssl_days_remaining'] = (expiry - datetime.now(timezone.utc)).days
-                                if result['ssl_days_remaining'] < 30:
-                                    result['cert_expiring_soon'] = True
-
-                            if cert.get('issuer') == cert.get('subject'):
-                                result['is_self_signed'] = True
-                                trust_score = 30
-                            else:
-                                trust_score = self.BASE_SCORE
-                        else:
-                            result['ssl_issuer'] = 'Valid (details unavailable)'
-                            result['trusted_ca'] = True
-                            result['cert_chain_complete'] = True
-                            result['is_self_signed'] = False
-                            trust_score = 85
-
-                        if not result.get('is_self_signed', False):
-                            if result.get('ssl_valid'):
-                                trust_score = min(97, trust_score + self.BONUS_SSL_VALID)
-                            if result.get('hsts_enabled'):
-                                trust_score = min(85, trust_score + self.BONUS_HSTS)
-                            if result.get('hsts_long_max_age'):
-                                trust_score = min(88, trust_score + self.BONUS_HSTS_LONG)
-                            if result.get('hsts_preload'):
-                                trust_score = min(90, trust_score + self.BONUS_HSTS_PRELOAD)
-                            if result.get('http_redirects_to_https'):
-                                trust_score = min(90, trust_score + self.BONUS_HTTPS_REDIRECT)
-                            if result.get('has_san', False):
-                                trust_score = min(92, trust_score + self.BONUS_HAS_SAN)
-                            if result.get('trusted_ca', False):
-                                trust_score = min(95, trust_score + self.BONUS_TRUSTED_CA)
-                            if result.get('cert_chain_complete', False):
-                                trust_score = min(97, trust_score + self.BONUS_CERT_CHAIN_COMPLETE)
-                            if result.get('ocsp_possible', False):
-                                trust_score = min(98, trust_score + self.BONUS_OCSP_HINT)
-                            if result.get('ocsp_stapling', False):
-                                trust_score = min(99, trust_score + self.BONUS_OCSP_STAPLING)
-                            if result.get('certificate_transparency', False):
-                                trust_score = min(99, trust_score + self.BONUS_CERTIFICATE_TRANSPARENCY)
-                            if result.get('signature_algorithm') and result['signature_algorithm'] in ["sha256", "sha384", "sha512"]:
-                                trust_score = min(99, trust_score + self.BONUS_STRONG_SIGNATURE)
-                            if result.get('perfect_forward_secrecy', False):
-                                trust_score = min(99, trust_score + self.BONUS_PFS)
-                            if result.get('supports_http2', False):
-                                trust_score = min(99, trust_score + self.BONUS_HTTP2)
-                            if result.get('supports_tls13', False):
-                                trust_score = min(99, trust_score + self.BONUS_TLS13)
-
-                            if result.get('cert_expiring_soon', False):
-                                trust_score = max(40, trust_score - self.PENALTY_CERT_EXPIRING)
-                            if result.get('hostname_mismatch', False):
-                                trust_score = max(20, trust_score - self.PENALTY_HOSTNAME_MISMATCH)
-                            if not result.get('has_san', False):
-                                trust_score = max(50, trust_score - self.PENALTY_NO_SAN)
-                            if result.get('is_wildcard_cert', False) and not result.get('trusted_ca', False):
-                                trust_score = max(60, trust_score - self.PENALTY_WILDCARD_CERT)
-                            if result.get('weak_tls', False):
-                                trust_score = max(40, trust_score - self.PENALTY_WEAK_TLS)
-                            if result.get('weak_signature', False):
-                                trust_score = max(30, trust_score - self.PENALTY_WEAK_SIGNATURE)
-                            if result.get('weak_key', False):
-                                trust_score = max(50, trust_score - self.PENALTY_WEAK_KEY)
-                            if result.get('tls_compression', False):
-                                trust_score = max(40, trust_score - self.PENALTY_TLS_COMPRESSION)
-                            if not result.get('has_ocsp_url', False):
-                                trust_score = max(50, trust_score - self.PENALTY_NO_OCSP_URL)
-                            if result.get('csp_unsafe_inline', False):
-                                trust_score = max(50, trust_score - self.PENALTY_CSP_UNSAFE_INLINE)
-                            if result.get('csp_unsafe_eval', False):
-                                trust_score = max(40, trust_score - self.PENALTY_CSP_UNSAFE_EVAL)
-                            if result.get('csp_wildcard', False):
-                                trust_score = max(55, trust_score - self.PENALTY_CSP_WILDCARD)
-
-                        result['trust_score'] = max(0, min(100, trust_score))
-                        result['_source'] = 'requests'
-                        self._logger.debug(f"Security analysis completed for {host}")
-
-                else:
-                    if scheme == "http":
-                        result['ssl_valid'] = False
-                        result['_source'] = 'http_only'
-                        trust_score = 40
-                        if result.get('security_headers'):
-                            trust_score += 10
-                        result['trust_score'] = min(60, trust_score)
-
-            except requests.exceptions.SSLError as e:
-                self._logger.warning(f"SSL error for {host}: {e}")
-                result['ssl_valid'] = False
-                result['supports_https'] = False
-                result['https_working'] = False
-                result['_source'] = 'ssl_error'
-                result['error_category'] = ServiceFailureReason.SSL_ERROR.value
-                result['trust_score'] = 10
-                network_errors.append(f"ssl: {str(e)}")
-                with self._metrics_lock:
-                    self.metrics["errors"] += 1
-
-            except requests.exceptions.ConnectionError as e:
-                self._logger.warning(f"Connection error for {host}: {e}")
-                result['ssl_valid'] = False
-                result['supports_https'] = False
-                result['https_working'] = False
-                result['_source'] = 'connection_error'
-                result['error_category'] = self._classify_failure(e).value
-                result['trust_score'] = 0
-                network_errors.append(f"connection: {str(e)}")
-                with self._metrics_lock:
-                    self.metrics["errors"] += 1
-
-            except requests.exceptions.Timeout as e:
-                self._logger.warning(f"Timeout for {host}: {e}")
-                result['ssl_valid'] = False
-                result['supports_https'] = False
-                result['https_working'] = False
-                result['_source'] = 'timeout'
-                result['error_category'] = ServiceFailureReason.TIMEOUT.value
-                result['trust_score'] = 0
-                network_errors.append(f"timeout: {str(e)}")
-                with self._metrics_lock:
-                    self.metrics["errors"] += 1
-
-            except Exception as e:
-                self._logger.error(f"Analysis failed for {host}: {e}")
-                result['_source'] = f'error: {str(e)[:50]}'
-                result['error_category'] = self._classify_failure(e).value
-                result['trust_score'] = 0
-                network_errors.append(f"unknown: {str(e)}")
-                with self._metrics_lock:
-                    self.metrics["errors"] += 1
-
-        finally:
-            if response:
-                self._close_response(response)
-            if http_response:
-                self._close_response(http_response)
-
-        result['trust_score'] = max(0, min(100, result['trust_score']))
-
-        duration_ms = (time.perf_counter() - start_time) * 1000
-        quality_score, confidence = self._calculate_quality_score(result, duration_ms, network_errors)
-
-        result['_quality_score'] = quality_score
-        result['_confidence'] = confidence
-        result['_network_errors'] = network_errors
-        result['_failure_reason'] = result.get('error_category', ServiceFailureReason.NONE.value)
-
-        return result
-
+	    start_time = time.perf_counter()
+	    network_errors = []
+	    
+	    # ✅ إنشاء النتيجة الأساسية (قيم افتراضية محايدة)
+	    result = {
+	        'host': host,
+	        'port': port,
+	        'scheme': scheme,
+	        'engine_version': self.ENGINE_VERSION,
+	        # SSL status
+	        'ssl_valid': None,
+	        'https_working': None,
+	        'supports_https': None,
+	        'supports_http': None,
+	        'ssl_issuer': None,
+	        'ssl_expiry': None,
+	        'ssl_days_remaining': None,
+	        'subject_alt_names': [],
+	        'has_san': False,
+	        'is_self_signed': False,
+	        'trusted_ca': False,
+	        'cert_chain_complete': False,
+	        'hostname_mismatch': False,
+	        'cert_expiring_soon': False,
+	        'weak_tls': False,
+	        'supports_tls13': False,
+	        'negotiated_tls_version': None,
+	        'cipher_suite': None,
+	        'perfect_forward_secrecy': False,
+	        # Security headers (✅ توحيد naming - فقط has_*)
+	        'has_hsts': False,
+	        'has_xfo': False,
+	        'has_xcto': False,
+	        'has_csp': False,          # ✅ موحد، لا يوجد csp_enabled منفصل
+	        'csp_unsafe_inline': False,
+	        'csp_unsafe_eval': False,
+	        'csp_wildcard': False,
+	        'hsts_preload': False,
+	        'hsts_long_max_age': False,
+	        'xfo_strong': False,
+	        # HTTP
+	        'http_redirects_to_https': False,
+	        'https_only': False,
+	        'mixed_content_detected': False,
+	        'final_url': None,
+	        'redirect_count': 0,
+	        'status_code': None,
+	        'server_header': None,
+	        'powered_by': None,
+	        'security_headers': {},
+	        # Trust & Quality
+	        'trust_score': 0,
+	        'analysis_failed': False,
+	        'failure_reason': None,
+	        '_source': None,
+	        '_quality_score': 0,
+	        '_confidence': AnalysisQuality.INCOMPLETE.value,
+	        '_analysis_completed': False,
+	        '_ssl_verified': False,
+	    }
+	    
+	    # إضافة الحقول الافتراضية من الدالة الأصلية
+	    default_result = self._create_empty_result(host, port)
+	    for key, value in default_result.items():
+	        if key not in result:
+	            result[key] = value
+	    result['scheme'] = scheme
+	
+	    headers_override = {
+	        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+	        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+	        "Accept-Language": "en-US,en;q=0.9",
+	        "Accept-Encoding": "gzip, deflate, br",
+	        "Cache-Control": "no-cache",
+	        "Pragma": "no-cache",
+	        "Connection": "close",
+	    }
+	    if profile:
+	        headers_override.update(profile.headers.copy())
+	        result['_profile_used'] = profile.name
+	
+	    response = None
+	    http_response = None
+	    sock = None
+	    ssl_verified = False
+	    
+	    # ✅ قائمة واحدة للعوامل (لا يتم إعادة تعريفها)
+	    positive_factors = []
+	    negative_factors = []
+	    
+	    # ✅ متغير لتتبع نجاح التحليل
+	    analysis_success = False
+	
+	    try:
+	        # ================================================================
+	        # 1. بناء الروابط
+	        # ================================================================
+	        if scheme == "https":
+	            if port == 443:
+	                url_main = f"https://{host}"
+	            else:
+	                url_main = f"https://{host}:{port}"
+	            url_http = f"http://{host}" if port == 443 else f"http://{host}:{port}"
+	        else:
+	            if port == 80:
+	                url_main = f"http://{host}"
+	            else:
+	                url_main = f"http://{host}:{port}"
+	            url_http = url_main
+	
+	        # ================================================================
+	        # 2. فحص HTTP → HTTPS Redirect
+	        # ================================================================
+	        if scheme == "https":
+	            try:
+	                http_response = await self._request("head", url_http, timeout=5.0, 
+	                                                    allow_redirects=False, 
+	                                                    headers=headers_override)
+	                if http_response.status_code < 500:
+	                    result['supports_http'] = True
+	                else:
+	                    result['supports_http'] = False
+	                    
+	                if http_response.status_code in (301, 302, 307, 308):
+	                    location = http_response.headers.get('Location', '')
+	                    if 'https' in location.lower():
+	                        result['http_redirects_to_https'] = True
+	                        result['https_only'] = True
+	                        positive_factors.append(('redirect_to_https', self.BONUS_HTTPS_REDIRECT))
+	                    else:
+	                        result['https_only'] = False
+	                else:
+	                    result['https_only'] = False
+	                    if http_response.status_code == 200:
+	                        result['supports_http_working'] = True
+	            except Exception as e:
+	                self._logger.debug(f"HTTP redirect check failed for {host}: {e}")
+	                network_errors.append(f"http_redirect: {str(e)[:100]}")
+	                result['supports_http'] = False
+	            finally:
+	                if http_response:
+	                    self._close_response(http_response)
+	                    http_response = None
+	
+	        # ================================================================
+	        # 3. فحص SSL الحقيقي (مع إغلاق آمن للـ socket)
+	        # ================================================================
+	        if scheme == "https":
+	            try:
+	                import ssl as ssl_module
+	                
+	                ssl_context = ssl_module.create_default_context()
+	                ssl_context.check_hostname = True
+	                ssl_context.verify_mode = ssl_module.CERT_REQUIRED
+	                
+	                sock = socket.create_connection((host, port), timeout=8.0)
+	                
+	                with ssl_context.wrap_socket(sock, server_hostname=host) as ssock:
+	                    sock = None
+	                    ssl_verified = True
+	                    result['_ssl_verified'] = True
+	                    result['supports_https'] = True
+	                    result['https_working'] = True
+	                    result['ssl_valid'] = True
+	                    
+	                    # ✅ عوامل إيجابية من SSL
+	                    positive_factors.append(('ssl_valid', self.BONUS_SSL_VALID))
+	                    
+	                    cert = ssock.getpeercert()
+	                    cipher = ssock.cipher()
+	                    tls_version = ssock.version()
+	                    
+	                    if cert:
+	                        issuer = dict(x[0] for x in cert.get('issuer', []))
+	                        result['ssl_issuer'] = issuer.get('organizationName', issuer.get('commonName', 'Unknown'))
+	                        
+	                        subject = dict(x[0] for x in cert.get('subject', []))
+	                        result['ssl_subject'] = subject.get('commonName', 'Unknown')
+	                        
+	                        san_list = cert.get('subjectAltName', [])
+	                        result['subject_alt_names'] = [san[1] for san in san_list if san[0] == 'DNS']
+	                        result['has_san'] = len(result['subject_alt_names']) > 0
+	                        
+	                        if result['has_san']:
+	                            positive_factors.append(('has_san', self.BONUS_HAS_SAN))
+	                        
+	                        # ✅ hostname matching (SAN first, then CN)
+	                        hostname_match = False
+	                        if result['has_san']:
+	                            for san in result['subject_alt_names']:
+	                                if self._match_hostname(host.lower(), san.lower()):
+	                                    hostname_match = True
+	                                    break
+	                        if not hostname_match and subject.get('commonName'):
+	                            if self._match_hostname(host.lower(), subject.get('commonName', '').lower()):
+	                                hostname_match = True
+	                        result['hostname_mismatch'] = not hostname_match
+	                        
+	                        if result['hostname_mismatch']:
+	                            negative_factors.append(('hostname_mismatch', self.PENALTY_HOSTNAME_MISMATCH))
+	                        
+	                        not_after = cert.get('notAfter')
+	                        if not_after:
+	                            try:
+	                                expiry = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z')
+	                                expiry = expiry.replace(tzinfo=timezone.utc)
+	                                result['ssl_expiry'] = expiry.strftime('%Y-%m-%d')
+	                                result['ssl_days_remaining'] = (expiry - datetime.now(timezone.utc)).days
+	                                result['cert_expiring_soon'] = result['ssl_days_remaining'] < 30
+	                                if result['cert_expiring_soon']:
+	                                    negative_factors.append(('cert_expiring', self.PENALTY_CERT_EXPIRING))
+	                            except Exception:
+	                                pass
+	                        
+	                        result['is_self_signed'] = (cert.get('issuer') == cert.get('subject'))
+	                        
+	                        issuer_lower = result['ssl_issuer'].lower()
+	                        result['trusted_ca'] = any(ca in issuer_lower for ca in self.KNOWN_TRUSTED_CAS)
+	                        if result['trusted_ca']:
+	                            positive_factors.append(('trusted_ca', self.BONUS_TRUSTED_CA))
+	                        
+	                        result['cert_chain_complete'] = result['trusted_ca'] or not result['is_self_signed']
+	                        if result['cert_chain_complete']:
+	                            positive_factors.append(('cert_chain', self.BONUS_CERT_CHAIN_COMPLETE))
+	                    
+	                    if cipher:
+	                        result['cipher_suite'] = cipher[0]
+	                        result['perfect_forward_secrecy'] = any(k in cipher[0] for k in ['ECDHE', 'DHE'])
+	                        if result['perfect_forward_secrecy']:
+	                            positive_factors.append(('pfs', self.BONUS_PFS))
+	                    
+	                    if tls_version:
+	                        result['negotiated_tls_version'] = tls_version
+	                        result['weak_tls'] = tls_version in ['TLSv1', 'TLSv1.1']
+	                        result['supports_tls13'] = tls_version == 'TLSv1.3'
+	                        if result['supports_tls13']:
+	                            positive_factors.append(('tls13', self.BONUS_TLS13))
+	                        if result['weak_tls']:
+	                            negative_factors.append(('weak_tls', self.PENALTY_WEAK_TLS))
+	                    
+	                    result['_source'] = 'ssl_direct_verify'
+	                    self._logger.info(f"✅ SSL verification succeeded for {host}: {tls_version}")
+	                    
+	            except ssl_module.SSLCertVerificationError as e:
+	                self._logger.warning(f"SSL certificate verification failed for {host}: {e}")
+	                result['ssl_valid'] = False
+	                result['supports_https'] = True
+	                result['https_working'] = True
+	                result['_source'] = 'ssl_cert_untrusted'
+	                result['trusted_ca'] = False
+	                result['failure_reason'] = f"SSL_CERT_UNTRUSTED: {str(e)[:100]}"
+	                network_errors.append(f"ssl_cert: {str(e)[:100]}")
+	                negative_factors.append(('ssl_untrusted', 25))
+	                
+	            except ssl_module.SSLError as e:
+	                self._logger.warning(f"SSL error for {host}: {e}")
+	                result['ssl_valid'] = False
+	                result['supports_https'] = True
+	                result['https_working'] = False
+	                result['_source'] = 'ssl_error'
+	                result['failure_reason'] = f"SSL_ERROR: {str(e)[:100]}"
+	                network_errors.append(f"ssl_error: {str(e)[:100]}")
+	                negative_factors.append(('ssl_error', 30))
+	                
+	            except (socket.timeout, TimeoutError) as e:
+	                self._logger.warning(f"SSL connection timeout for {host}: {e}")
+	                result['ssl_valid'] = False
+	                result['supports_https'] = None
+	                result['https_working'] = False
+	                result['_source'] = 'ssl_timeout'
+	                result['failure_reason'] = f"TIMEOUT: {str(e)[:100]}"
+	                network_errors.append(f"ssl_timeout: {str(e)[:100]}")
+	                negative_factors.append(('ssl_timeout', 20))
+	                
+	            except Exception as e:
+	                self._logger.warning(f"SSL check failed for {host}: {e}")
+	                result['ssl_valid'] = False
+	                result['supports_https'] = None
+	                result['https_working'] = False
+	                result['_source'] = f'ssl_failed: {type(e).__name__}'
+	                result['failure_reason'] = f"{type(e).__name__}: {str(e)[:100]}"
+	                network_errors.append(f"ssl_failed: {str(e)[:100]}")
+	                negative_factors.append(('ssl_failed', 20))
+	                
+	            finally:
+	                if sock:
+	                    try:
+	                        sock.close()
+	                    except:
+	                        pass
+	
+	        # ================================================================
+	        # 4. جلب الرؤوس وتحليل المحتوى
+	        # ================================================================
+	        if AIOHTTP_AVAILABLE:
+	            try:
+	                import aiohttp
+	                
+	                # ✅ ملاحظة: SSL=False لأن SSL تم التحقق منه مسبقاً (فصل متعمد للطبقات)
+	                # هذا التصميم يسمح بفحص SSL بشكل مستقل عن طبقة HTTP
+	                connector = aiohttp.TCPConnector(ssl=False)
+	                timeout = aiohttp.ClientTimeout(total=15, connect=10)
+	                
+	                async with aiohttp.ClientSession(connector=connector, timeout=timeout, 
+	                                                  headers=headers_override) as session:
+	                    async with session.get(url_main, allow_redirects=True, max_redirects=10) as resp:
+	                        result['final_url'] = str(resp.url)
+	                        result['redirect_count'] = len(resp.history)
+	                        result['status_code'] = resp.status
+	                        analysis_success = True
+	                        result['_analysis_completed'] = True
+	                        
+	                        all_headers = dict(resp.headers)
+	                        result['server_header'] = all_headers.get('server')
+	                        result['powered_by'] = all_headers.get('x-powered-by')
+	                        
+	                        # ✅ استخدام has_* فقط (توحيد)
+	                        result['has_hsts'] = 'strict-transport-security' in all_headers
+	                        result['has_xfo'] = 'x-frame-options' in all_headers
+	                        result['has_xcto'] = 'x-content-type-options' in all_headers
+	                        result['has_csp'] = 'content-security-policy' in all_headers
+	                        
+	                        security_headers = {}
+	                        for header in self.SECURITY_HEADERS_LIST:
+	                            security_headers[header] = header in all_headers
+	                        result['security_headers'] = security_headers
+	                        
+	                        # HSTS
+	                        hsts = all_headers.get('strict-transport-security', '')
+	                        result['hsts_enabled'] = bool(hsts)
+	                        result['hsts_long_max_age'] = 'max-age=31536000' in hsts if hsts else False
+	                        result['hsts_preload'] = 'preload' in hsts.lower() if hsts else False
+	                        
+	                        if result['hsts_enabled']:
+	                            positive_factors.append(('hsts', self.BONUS_HSTS))
+	                            if result['hsts_long_max_age']:
+	                                positive_factors.append(('hsts_long', self.BONUS_HSTS_LONG))
+	                            if result['hsts_preload']:
+	                                positive_factors.append(('hsts_preload', self.BONUS_HSTS_PRELOAD))
+	                        elif scheme == "https" and result.get('https_working'):
+	                            negative_factors.append(('no_hsts', 8))
+	                        
+	                        # XFO
+	                        xfo = all_headers.get('x-frame-options', '').lower()
+	                        result['xfo_strong'] = xfo in ['deny', 'sameorigin']
+	                        if result['xfo_strong']:
+	                            positive_factors.append(('xfo_strong', 5))
+	                        elif result['has_xfo'] is False and scheme == "https":
+	                            negative_factors.append(('no_xfo', 5))
+	                        
+	                        # CSP (✅ موحد)
+	                        csp = all_headers.get('content-security-policy', '').lower()
+	                        result['csp_unsafe_inline'] = 'unsafe-inline' in csp
+	                        result['csp_unsafe_eval'] = 'unsafe-eval' in csp
+	                        result['csp_wildcard'] = '*' in csp
+	                        
+	                        if result['has_csp'] and not result['csp_unsafe_inline']:
+	                            positive_factors.append(('csp_secure', 8))
+	                        elif result['csp_unsafe_inline']:
+	                            negative_factors.append(('csp_unsafe', 6))
+	                        
+	                        if result['has_xcto']:
+	                            positive_factors.append(('xcto', 3))
+	                        
+	                        # Security headers count
+	                        headers_count = sum(1 for v in security_headers.values() if v)
+	                        if headers_count >= 5:
+	                            positive_factors.append(('headers_full', 15))
+	                        elif headers_count <= 1 and scheme == "https" and result.get('https_working'):
+	                            negative_factors.append(('headers_none', 10))
+	                        
+	                        # Mixed content detection (محسن)
+	                        try:
+	                            content_sample = await resp.text()
+	                            mixed_patterns = [
+	                                r'src=["\']http://[^"\']+["\']',
+	                                r'href=["\']http://[^"\']+["\']',
+	                                r'<link[^>]+href=["\']http://',
+	                                r'<script[^>]+src=["\']http://',
+	                            ]
+	                            for pattern in mixed_patterns:
+	                                if re.search(pattern, content_sample, re.IGNORECASE):
+	                                    result['mixed_content_detected'] = True
+	                                    negative_factors.append(('mixed_content', 10))
+	                                    break
+	                        except:
+	                            pass
+	                        
+	                        result['_source'] = result.get('_source', 'aiohttp_success')
+	                        
+	            except Exception as e:
+	                self._logger.warning(f"aiohttp request failed for {host}: {e}")
+	                network_errors.append(f"aiohttp: {str(e)[:100]}")
+	                negative_factors.append(('http_failed', 15))
+	        else:
+	            # Fallback لـ requests
+	            try:
+	                import requests
+	                
+	                session = requests.Session()
+	                session.headers.update(headers_override)
+	                session.max_redirects = 10
+	                
+	                resp = session.get(url_main, timeout=15, verify=True, allow_redirects=True)
+	                
+	                result['final_url'] = resp.url
+	                result['redirect_count'] = len(resp.history)
+	                result['status_code'] = resp.status_code
+	                analysis_success = True
+	                result['_analysis_completed'] = True
+	                
+	                all_headers = dict(resp.headers)
+	                result['server_header'] = all_headers.get('server')
+	                result['powered_by'] = all_headers.get('x-powered-by')
+	                
+	                result['has_hsts'] = 'strict-transport-security' in all_headers
+	                result['has_xfo'] = 'x-frame-options' in all_headers
+	                result['has_xcto'] = 'x-content-type-options' in all_headers
+	                result['has_csp'] = 'content-security-policy' in all_headers
+	                
+	                security_headers = {}
+	                for header in self.SECURITY_HEADERS_LIST:
+	                    security_headers[header] = header in all_headers
+	                result['security_headers'] = security_headers
+	                
+	                hsts = all_headers.get('strict-transport-security', '')
+	                result['hsts_enabled'] = bool(hsts)
+	                result['hsts_long_max_age'] = 'max-age=31536000' in hsts if hsts else False
+	                result['hsts_preload'] = 'preload' in hsts.lower() if hsts else False
+	                
+	                if result['hsts_enabled']:
+	                    positive_factors.append(('hsts', self.BONUS_HSTS))
+	                
+	                xfo = all_headers.get('x-frame-options', '').lower()
+	                result['xfo_strong'] = xfo in ['deny', 'sameorigin']
+	                if result['xfo_strong']:
+	                    positive_factors.append(('xfo_strong', 5))
+	                
+	                csp = all_headers.get('content-security-policy', '').lower()
+	                result['csp_unsafe_inline'] = 'unsafe-inline' in csp
+	                result['csp_unsafe_eval'] = 'unsafe-eval' in csp
+	                result['csp_wildcard'] = '*' in csp
+	                
+	                if result['has_csp'] and not result['csp_unsafe_inline']:
+	                    positive_factors.append(('csp_secure', 8))
+	                
+	                if result['has_xcto']:
+	                    positive_factors.append(('xcto', 3))
+	                
+	                headers_count = sum(1 for v in security_headers.values() if v)
+	                if headers_count >= 5:
+	                    positive_factors.append(('headers_full', 15))
+	                
+	                resp.close()
+	                session.close()
+	                result['_source'] = result.get('_source', 'requests_success')
+	                
+	            except Exception as e:
+	                self._logger.warning(f"Requests fallback failed for {host}: {e}")
+	                network_errors.append(f"requests: {str(e)[:100]}")
+	                negative_factors.append(('http_failed', 15))
+	
+	    except Exception as e:
+	        self._logger.error(f"Critical error in _perform_analysis for {host}: {e}")
+	        result['analysis_failed'] = True
+	        result['failure_reason'] = f"CRITICAL: {type(e).__name__}: {str(e)[:100]}"
+	        network_errors.append(f"critical: {str(e)[:100]}")
+	        negative_factors.append(('critical_error', 50))
+	        with self._metrics_lock:
+	            self.metrics["errors"] += 1
+	
+	    finally:
+	        if response:
+	            self._close_response(response)
+	        if http_response:
+	            self._close_response(http_response)
+	
+	    # ================================================================
+	    # 5. حساب trust_score (نظام تجميعي مع baseline=50 للمواقع المعروفة)
+	    # ================================================================
+	    
+	    # ✅ baseline = 50 (محايد/غير معروف) - هذا أكثر عدلاً من 0
+	    # 50 تعني "لا نملك معلومات كافية"، وهذا صحيح للمواقع العادية
+	    trust_score_calculated = 50.0
+	    
+	    # ✅ تطبيق العوامل (بدون إعادة تعريف)
+	    for name, value in positive_factors:
+	        trust_score_calculated += value
+	        self._logger.debug(f"  + {name}: +{value}")
+	    
+	    for name, value in negative_factors:
+	        trust_score_calculated -= value
+	        self._logger.debug(f"  - {name}: -{value}")
+	    
+	    # ✅ معالجة خاصة لـ analysis_failed
+	    if result.get('analysis_failed') or not analysis_success:
+	        trust_score_calculated = min(trust_score_calculated, 20)
+	        result['analysis_failed'] = True
+	    
+	    # ✅ إذا كان SSL فعالاً، نعطي حداً أدنى مناسباً
+	    if result.get('ssl_valid') is True and result.get('https_working'):
+	        trust_score_calculated = max(trust_score_calculated, 40)
+	    
+	    # ✅ التقليص النهائي
+	    trust_score_calculated = max(0, min(100, trust_score_calculated))
+	    result['trust_score'] = round(trust_score_calculated, 1)
+	    
+	    # ================================================================
+	    # 6. حساب quality_score والثقة
+	    # ================================================================
+	    
+	    duration_ms = (time.perf_counter() - start_time) * 1000
+	    quality_score, confidence = self._calculate_quality_score(result, duration_ms, network_errors)
+	    
+	    # ✅ تعديل الثقة بناءً على جودة الفحص
+	    if result.get('analysis_failed') or not analysis_success:
+	        quality_score = min(quality_score, 20)
+	        confidence = AnalysisQuality.INCOMPLETE.value
+	        result['_confidence'] = confidence
+	    elif quality_score < 40:
+	        confidence = AnalysisQuality.POOR.value
+	        result['_confidence'] = confidence
+	    
+	    result['_quality_score'] = quality_score
+	    result['_confidence'] = confidence
+	    result['_network_errors'] = network_errors
+	    result['_analysis_completed'] = analysis_success
+	    result['scan_duration'] = duration_ms
+	    
+	    # ✅ تخزين العوامل للتشخيص
+	    result['_scoring_factors'] = {
+	        'positive': positive_factors.copy(),
+	        'negative': negative_factors.copy(),
+	        'baseline': 50,
+	        'final_score': result['trust_score']
+	    }
+	    
+	    self._logger.info(f"Analysis for {host}: trust_score={result['trust_score']}, "
+	                      f"quality={quality_score}, confidence={confidence}, "
+	                      f"ssl_verified={ssl_verified}, +{len(positive_factors)}/-{len(negative_factors)}")
+	    
+	    return result
+	
     def _match_hostname(self, host: str, pattern: str) -> bool:
         if pattern.startswith('*.'):
             suffix = pattern[2:]
@@ -4002,7 +4168,6 @@ class HeaderFetcherEngine:
 
     def _get_connector(self):
         """إعادة استخدام connector"""
-        import aiohttp
 
         if self._connector is None or self._connector.closed:
             self._connector = aiohttp.TCPConnector(
@@ -4018,7 +4183,6 @@ class HeaderFetcherEngine:
 
     def _resolve_dns(self, hostname: str):
         """DNS resolution (متزامن - يعمل في thread)"""
-        import dns.resolver
 
         results = {"A": [], "AAAA": []}
         try:
@@ -4041,15 +4205,7 @@ class HeaderFetcherEngine:
         if not AIOHTTP_AVAILABLE or not self._available:
             return {"success": False, "error": "aiohttp not available"}
 
-        import time
-        import random
-        import asyncio
-        import aiohttp
-        from urllib.parse import urlparse
-        from datetime import datetime
-        from email.utils import parsedate_to_datetime
-
-        # تجهيز الرابط
+   # تجهيز الرابط
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
 
@@ -4100,7 +4256,7 @@ class HeaderFetcherEngine:
             )
 
         timeout = aiohttp.ClientTimeout(total=10, connect=5)
-        cookie_jar = aiohttp.ClientCookieJar()
+        cookie_jar = aiohttp.CookieJar()
 
         async with aiohttp.ClientSession(
             timeout=timeout,
@@ -4506,15 +4662,15 @@ class UltimateWhoisAnalyzer:
         """تحديد جودة التحليل"""
         source = result.get('_source')
         
-        if source == 'real_whois':
+        if result.get('_source') == 'real_whois':
             if result.get('domain_age_years') and result.get('domain_registrar'):
                 return AnalysisQuality.EXCELLENT.value
             return AnalysisQuality.GOOD.value
-        elif source == 'known_database':
+        elif result.get('_source') == 'known_database':
             return AnalysisQuality.GOOD.value
-        elif source == 'dns_estimation':
+        elif result.get('_source') == 'dns_estimation':
             return AnalysisQuality.FAIR.value
-        elif source == 'unknown':
+        elif result.get('_source') == 'unknown':
             return AnalysisQuality.INCOMPLETE.value
         
         return AnalysisQuality.FAIR.value
@@ -4802,6 +4958,7 @@ class UltimateWhoisAnalyzer:
 
     async def _enrich_result(self, result: Dict):
         """إثراء النتيجة بمعلومات محسوبة وتعديل trust_score"""
+        result['age_years'] = result.get('domain_age_years')
         result['domain_age_category'] = self._get_age_category(result.get('domain_age_years'))
         result['analysis_quality'] = self._get_analysis_quality(result)
         
@@ -8298,6 +8455,8 @@ class BaseAnalyzer:
                 result = await asyncio.wait_for(
                     ultimate_whois.analyze(domain), timeout=whois_timeout
                 )
+                print(f"DEBUG ensure_whois: result keys = {result.keys() if result else 'None'}")
+                print(f"DEBUG ensure_whois: age_years = {result.get('domain_age_years') if result else 'None'}")
                 ctx.whois_info.update(result)
             except asyncio.TimeoutError:
                 self.logger.warning(f"WHOIS timeout for {domain}")
@@ -9097,89 +9256,27 @@ class HeadersAnalyzer(BaseAnalyzer):
     depends_on = ["url_parser"]
 
     async def run(self, ctx: ScanContext) -> None:
-        # ✅ استخدام requests مباشرة بدلاً من ensure_http_headers
-        import requests
+        await self.ensure_http_headers(ctx)
         
-        url = ctx.target
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
+        has_hsts = ctx.http_headers.get("has_hsts", False)
+        has_xfo = ctx.http_headers.get("has_xfo", False)
+        has_xcto = ctx.http_headers.get("has_xcto", False)
+        has_csp = ctx.http_headers.get("has_csp", False)
+        has_referrer = ctx.http_headers.get("referrer_policy", False) or ctx.http_headers.get("has_referrer_policy", False)
+        has_permissions = ctx.http_headers.get("permissions_policy", False) or ctx.http_headers.get("has_permissions_policy", False)
+        hsts_preload = ctx.http_headers.get("hsts_preload", False)
+        xfo_strong = ctx.http_headers.get("xfo_strong", False)
+        csp_unsafe_inline = ctx.http_headers.get("csp_unsafe_inline", False)
+        csp_unsafe_eval = ctx.http_headers.get("csp_unsafe_eval", False)
         
-        has_hsts = False
-        has_xfo = False
-        has_xcto = False
-        has_csp = False
-        has_csp_report_only = False
-        has_referrer = False
-        has_permissions = False
-        hsts_preload = False
-        xfo_strong = False
-        csp_unsafe_inline = False
-        csp_unsafe_eval = False
-        server_header = None
-        final_url = url
-        
-        try:
-            # جلب الرؤوس في thread منفصل (غير محظور)
-            loop = asyncio.get_running_loop()
-            
-            def fetch():
-                r = requests.get(url, timeout=10, allow_redirects=True,
-                               headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-                return dict(r.headers), str(r.url)
-            
-            headers, final_url = await loop.run_in_executor(None, fetch)
-            
-            # تحويل المفاتيح إلى lowercase
-            headers_lower = {k.lower(): v for k, v in headers.items()}
-            
-            # استخراج رؤوس الأمان
-            has_hsts = "strict-transport-security" in headers_lower
-            has_xfo = "x-frame-options" in headers_lower
-            has_xcto = "x-content-type-options" in headers_lower
-            has_csp = "content-security-policy" in headers_lower
-            has_csp_report_only = "content-security-policy-report-only" in headers_lower
-            has_referrer = "referrer-policy" in headers_lower
-            has_permissions = "permissions-policy" in headers_lower
-            server_header = headers_lower.get("server")
-            
-            # تحليل HSTS
-            if has_hsts:
-                hsts_value = headers_lower.get("strict-transport-security", "")
-                hsts_preload = "preload" in hsts_value.lower()
-            
-            # تحليل XFO
-            if has_xfo:
-                xfo_value = headers_lower.get("x-frame-options", "").lower()
-                xfo_strong = xfo_value in ["deny", "sameorigin"]
-            
-            # تحليل CSP
-            if has_csp:
-                csp_value = headers_lower.get("content-security-policy", "").lower()
-                csp_unsafe_inline = "unsafe-inline" in csp_value
-                csp_unsafe_eval = "unsafe-eval" in csp_value
-            
-        except Exception as e:
-            # في حالة الفشل، نستخدم القيم الافتراضية
-            pass
-        
-        # بناء security_headers
-        security_headers = {
-            "strict-transport-security": has_hsts,
-            "x-frame-options": has_xfo,
-            "x-content-type-options": has_xcto,
-            "content-security-policy": has_csp or has_csp_report_only,
-            "referrer-policy": has_referrer,
-            "permissions-policy": has_permissions,
-        }
+        security_headers = ctx.http_headers.get("security_headers", {})
         present_headers = [h for h, v in security_headers.items() if v]
         security_headers_count = len(present_headers)
         
-        # تخزين البيانات
         ctx.add_data_sync("has_hsts", has_hsts)
         ctx.add_data_sync("has_xfo", has_xfo)
         ctx.add_data_sync("has_xcto", has_xcto)
         ctx.add_data_sync("has_csp", has_csp)
-        ctx.add_data_sync("has_csp_report_only", has_csp_report_only)
         ctx.add_data_sync("has_referrer_policy", has_referrer)
         ctx.add_data_sync("has_permissions_policy", has_permissions)
         ctx.add_data_sync("hsts_preload", hsts_preload)
@@ -9189,10 +9286,9 @@ class HeadersAnalyzer(BaseAnalyzer):
         ctx.add_data_sync("security_headers", security_headers)
         ctx.add_data_sync("present_security_headers", present_headers)
         ctx.add_data_sync("security_headers_count", security_headers_count)
-        ctx.add_data_sync("final_url", final_url)
-        ctx.add_data_sync("server_header", server_header)
+        ctx.add_data_sync("final_url", ctx.http_headers.get("final_url"))
+        ctx.add_data_sync("server_header", ctx.http_headers.get("server_header"))
         
-        # حساب score
         score = 0
         if has_hsts: score += 2
         if hsts_preload: score += 1
@@ -9203,8 +9299,6 @@ class HeadersAnalyzer(BaseAnalyzer):
             score += 2
             if not csp_unsafe_inline: score += 1
             if not csp_unsafe_eval: score += 1
-        elif has_csp_report_only:
-            score += 1  # CSP Report-Only أفضل من لا شيء
         if has_referrer: score += 1
         if has_permissions: score += 1
         
@@ -9224,7 +9318,6 @@ class HeadersAnalyzer(BaseAnalyzer):
         ctx.add_data_sync("security_score", security_score)
         ctx.add_data_sync("risk_score", 100 - security_score)
         
-        # الإشارات
         if has_hsts:
             ctx.add_positive_signal_sync(RiskSignal.HSTS_ENABLED)
             if hsts_preload:
@@ -9249,8 +9342,6 @@ class HeadersAnalyzer(BaseAnalyzer):
                 ctx.add_risk_signal_sync("CSP_UNSAFE_INLINE", warning="⚠️ CSP يستخدم unsafe-inline")
             if csp_unsafe_eval:
                 ctx.add_risk_signal_sync("CSP_UNSAFE_EVAL", warning="⚠️ CSP يستخدم unsafe-eval")
-        elif has_csp_report_only:
-            ctx.add_risk_signal_sync("CSP_REPORT_ONLY", warning="⚠️ CSP في وضع Report-Only - ليس مفعلاً بالكامل")
         else:
             ctx.add_risk_signal_sync(RiskSignal.NO_CSP, warning="⚠️ CSP غير موجود")
         
@@ -9259,12 +9350,11 @@ class HeadersAnalyzer(BaseAnalyzer):
         elif security_headers_count == 0:
             ctx.add_risk_signal_sync(RiskSignal.SECURITY_HEADERS_NONE, warning="⚠️ لا توجد رؤوس أمان")
         
-        # توصيات
         if not has_hsts and ctx.is_https:
             ctx.recommend_sync("🔒 قم بتفعيل HSTS لفرض HTTPS")
         if not has_xfo:
             ctx.recommend_sync("🖼️ قم بإضافة X-Frame-Options لمنع clickjacking")
-        if not has_csp and not has_csp_report_only:
+        if not has_csp:
             ctx.recommend_sync("🛡️ قم بإضافة Content-Security-Policy لمنع XSS")
         if has_csp and csp_unsafe_inline:
             ctx.recommend_sync("⚠️ تجنب استخدام unsafe-inline في CSP - استخدم nonce أو hash")
@@ -9284,6 +9374,7 @@ class HeadersAnalyzer(BaseAnalyzer):
             ctx.add_data_sync("analysis_summary", f"⚠️ رؤوس أمان متوسطة - درجة {grade} ({headers_count} رؤوس)")
         else:
             ctx.add_data_sync("analysis_summary", f"❌ رؤوس أمان ضعيفة - درجة {grade} ({headers_count} رؤوس)")
+
 
 class WhoisAnalyzer(BaseAnalyzer):
     """فحص WHOIS المتقدم"""
@@ -11206,76 +11297,233 @@ class CreditCardAnalyzer(BaseAnalyzer):
 
 
 class PortAnalyzer(BaseAnalyzer):
-    """فحص المنافذ المتقدم"""
+    """محلل المنافذ - Enterprise Grade Final"""
     name = "port_check"
-    description = "يفحص المنافذ المفتوحة مع تحليل الخدمات"
+    description = "يفحص المنافذ المفتوحة ويحلل المخاطر"
     priority = 80
     timeout = 10.0
     requires_network = True
+    depends_on = ["dns_check"]
+
+    RISK_WEIGHTS = {"CRITICAL": 100, "HIGH": 60, "MEDIUM": 30, "LOW": 0}
+    DANGEROUS_COMBINATIONS = [
+        ({21, 23}, 20), ({22, 3389}, 25), ({22, 23}, 30),
+        ({21, 22, 23}, 35), ({3306, 6379}, 20), ({135, 139, 445}, 30),
+    ]
+    SAFE_WEB_PORTS = {80, 443, 8080, 8443}
+    UNEXPECTED_ADMIN_PORTS = {21, 22, 23, 3389, 5900}
+    DATABASE_PORTS = {3306, 5432, 6379, 27017}
+    FILTERED_PENALTY = 5
+    TIMEOUT_PENALTY = 3
+    
+    RISK_NORMALIZATION = {"vuln": 0.4, "infra": 0.35, "behavior": 0.25}
+
+    @staticmethod
+    def _classify_port(port: int) -> str:
+        if 0 < port < 1024:
+            return "System"
+        if 1024 <= port <= 49151:
+            return "User"
+        if port > 49151:
+            return "Dynamic"
+        return "Unknown"
+
+    def _determine_scan_profile(self, ctx: ScanContext) -> str:
+        if ctx.has_capability(ScanCapability.WEB_SERVER):
+            return "deep"
+        return ctx.data.get("scan_profile", "quick")
+
+    def _normalize_risk(self, vuln_score: float, infra_score: float, behavior_score: float) -> float:
+        return (
+            vuln_score * self.RISK_NORMALIZATION["vuln"] + 
+            infra_score * self.RISK_NORMALIZATION["infra"] + 
+            behavior_score * self.RISK_NORMALIZATION["behavior"]
+        )
 
     async def run(self, ctx: ScanContext) -> None:
-        target = ctx.target.strip()
+        ctx.add_data_sync("target", ctx.target.strip())
         
-        try:
-            ipaddress.ip_address(target)
-            host = target
-            ctx.add_data_sync("is_ip", True)
-        except ValueError:
-            host = target
-            ctx.add_data_sync("is_ip", False)
+        addresses = ctx.data.get("resolved_addresses", [getattr(ctx, "host", ctx.target)])
+        ports_to_scan = ctx.data.get("ports_to_scan", PortKnowledgeBase.COMMON_PORTS[:20])
+        scan_profile = self._determine_scan_profile(ctx)
         
-        ctx.add_data_sync("target", host)
+        scanner = PortScanner(timeout_profile=scan_profile)
+        findings = await scanner.scan_batch(addresses, ports_to_scan)
         
-        async def check_port(host, port):
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(host, port), timeout=1.0
-                )
-                service = shared_db.PORT_SERVICES.get(port, ("UNKNOWN", f"Port {port}", "LOW"))
-                result = {"port": port, "service": service[0], "description": service[1], "risk": service[2]}
-                writer.close()
-                try: await writer.wait_closed()
-                except: pass
-                return result
-            except:
-                return None
+        ctx.add_data_sync("port_findings", [
+            {"port": f.port, "status": f.status, "service": f.service, "risk": f.risk_level, "latency_ms": f.latency_ms}
+            for f in findings
+        ])
         
-        tasks = [check_port(host, port) for port in shared_db.COMMON_PORTS[:20]]
-        results = await asyncio.gather(*tasks)
+        open_findings = [f for f in findings if f.status == "open"]
+        timeout_count = sum(1 for f in findings if f.status == "timeout")
+        filtered_count = sum(1 for f in findings if f.status == "filtered")
+        closed_count = sum(1 for f in findings if f.status == "closed")
+        open_ports_set = {f.port for f in open_findings}
         
-        open_ports = [r for r in results if r is not None]
-        critical_ports = [p["port"] for p in open_ports if p["risk"] == "CRITICAL"]
-        high_ports = [p["port"] for p in open_ports if p["risk"] == "HIGH"]
+        system_ports = {p for p in open_ports_set if 0 < p < 1024}
+        user_ports = {p for p in open_ports_set if 1024 <= p <= 49151}
+        dynamic_ports = {p for p in open_ports_set if p > 49151}
         
-        ctx.add_data_sync("open_ports", open_ports)
-        ctx.add_data_sync("open_ports_count", len(open_ports))
-        ctx.add_data_sync("critical_ports", critical_ports)
-        ctx.add_data_sync("high_ports", high_ports)
+        ctx.add_data_sync("open_ports_count", len(open_findings))
+        ctx.add_data_sync("timeout_ports_count", timeout_count)
+        ctx.add_data_sync("filtered_ports_count", filtered_count)
+        ctx.add_data_sync("closed_ports_count", closed_count)
+
+        # Vuln score - فقط من الثغرات المعروفة
+        vuln_score = sum(self.RISK_WEIGHTS.get(f.risk_level, 0) for f in open_findings)
         
-        risk_score = 0
-        if critical_ports: risk_score = 90
-        elif high_ports: risk_score = 60
-        elif open_ports: risk_score = min(50, len(open_ports) * 5)
+        # Infra score - فقط من التوبولوجيا والتوليفات (بدون vuln_score)
+        infra_score = 0
         
+        if open_ports_set and open_ports_set.issubset(self.SAFE_WEB_PORTS):
+            infra_score = 0
+        
+        for combo, penalty in self.DANGEROUS_COMBINATIONS:
+            if combo.issubset(open_ports_set):
+                infra_score += penalty
+        
+        density = len(open_findings)
+        if density > 6:
+            infra_score += 15 + (density - 6) * 10
+        elif density > 3:
+            infra_score += (density - 3) * 5
+        
+        if ctx.has_capability(ScanCapability.WEB_SERVER):
+            if open_ports_set & self.UNEXPECTED_ADMIN_PORTS:
+                infra_score += 15
+            if open_ports_set & self.DATABASE_PORTS:
+                infra_score += 25
+        
+        # Behavior score - من سلوك الشبكة فقط
+        behavior_score = (self.FILTERED_PENALTY * filtered_count) + (self.TIMEOUT_PENALTY * timeout_count)
+        
+        risk_score = min(100, self._normalize_risk(vuln_score, infra_score, behavior_score))
         security_score = 100 - risk_score
+
+        primary_port = None
+        if open_findings:
+            risk_order = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+            primary_finding = max(open_findings, key=lambda p: (risk_order.get(p.risk_level, 0), p.latency_ms if p.latency_ms else 0))
+            primary_port = primary_finding.port
+
+        signals = []
         
-        ctx.add_data_sync("security_score", security_score)
-        ctx.add_data_sync("risk_score", risk_score)
+        if open_findings:
+            signals.append(ConfidenceSignal("OPEN_PORTS_FOUND", 0.99, "info"))
         
-        if open_ports:
-            if critical_ports:
-                ctx.add_risk_signal_sync("OPEN_PORT_CRITICAL", warning=f'🚨 منافذ حرجة مفتوحة: {critical_ports}')
-                ctx.recommend_sync(f"🚨 أغلق المنافذ الحرجة فوراً: {critical_ports}")
-                ctx.add_data_sync("analysis_summary", f"🚨 {len(critical_ports)} منافذ حرجة مفتوحة")
-            elif high_ports:
-                ctx.add_risk_signal_sync("OPEN_PORT_HIGH", warning=f'⚠️ منافذ عالية المخاطر: {high_ports}')
-                ctx.add_data_sync("analysis_summary", f"⚠️ {len(open_ports)} منفذ مفتوح")
+        if open_ports_set & self.SAFE_WEB_PORTS:
+            signals.append(ConfidenceSignal("WEB_PORT", 0.95, "info"))
+        if open_ports_set & self.DATABASE_PORTS:
+            signals.append(ConfidenceSignal("DATABASE_PORT", 0.90, "high"))
+        if open_ports_set & self.UNEXPECTED_ADMIN_PORTS:
+            signals.append(ConfidenceSignal("REMOTE_ACCESS_PORT", 0.95, "critical"))
+            signals.append(ConfidenceSignal("ADMIN_PORT_ON_WEB_SERVER", 0.85, "high"))
+        if open_ports_set & {21, 23, 25, 110}:
+            signals.append(ConfidenceSignal("LEGACY_PORT", 0.90, "medium"))
+
+        if system_ports:
+            signals.append(ConfidenceSignal("SYSTEM_PORT", 0.95, "medium"))
+        if user_ports:
+            signals.append(ConfidenceSignal("USER_PORT", 0.90, "info"))
+        if dynamic_ports:
+            signals.append(ConfidenceSignal("DYNAMIC_PORT", 0.85, "low"))
+
+        if any(f.risk_level == "CRITICAL" for f in open_findings):
+            signals.append(ConfidenceSignal("CRITICAL_PORT_EXPOSED", 0.99, "critical"))
+        elif any(f.risk_level == "HIGH" for f in open_findings):
+            signals.append(ConfidenceSignal("HIGH_RISK_PORT_EXPOSED", 0.95, "high"))
+
+        if any(p in PortKnowledgeBase.PLAINTEXT_PORTS for p in open_ports_set):
+            signals.append(ConfidenceSignal("PLAINTEXT_PROTOCOL", 0.90, "high"))
+
+        if density > 6:
+            signals.append(ConfidenceSignal("HIGH_PORT_DENSITY", 0.85, "high"))
+        elif density > 3:
+            signals.append(ConfidenceSignal("MODERATE_PORT_DENSITY", 0.80, "medium"))
+
+        if filtered_count > 0:
+            signals.append(ConfidenceSignal("FILTERED_PORTS_DETECTED", 0.75, "medium"))
+        if timeout_count > 0:
+            signals.append(ConfidenceSignal("TIMEOUT_PORTS_DETECTED", 0.70, "low"))
+        if closed_count > 0:
+            signals.append(ConfidenceSignal("CLOSED_PORTS_DETECTED", 0.99, "info"))
+
+        if not open_findings:
+            signals.append(ConfidenceSignal("NO_OPEN_PORTS", 0.99, "info"))
+
+        # Dedup مع الاحتفاظ بأعلى confidence و severity
+        unique = {}
+        for s in signals:
+            if s.signal not in unique:
+                unique[s.signal] = s
             else:
-                ctx.add_data_sync("analysis_summary", f"ℹ️ {len(open_ports)} منفذ مفتوح")
-        else:
-            ctx.add_positive_signal_sync("NO_OPEN_PORTS")
-            ctx.add_data_sync("analysis_summary", "✅ لا توجد منافذ مفتوحة")
+                existing = unique[s.signal]
+                if s.confidence > existing.confidence:
+                    unique[s.signal] = s
+                elif s.confidence == existing.confidence:
+                    sev_order = PortKnowledgeBase.SEVERITY_ORDER
+                    if sev_order.get(s.severity, 0) > sev_order.get(existing.severity, 0):
+                        unique[s.signal] = s
         
+        ctx.add_data_sync("port_signals", [
+            {"signal": s.signal, "confidence": s.confidence, "severity": s.severity}
+            for s in unique.values()
+        ])
+
+        # ML features - stable p50 calculation
+        latencies = sorted([f.latency_ms for f in findings if f.latency_ms > 0])
+        latency_p50 = latencies[len(latencies) // 2] if latencies else 0
+        
+        ctx.add_data_sync("ml_features", {
+            "open_ports": len(open_findings),
+            "risk_density": density,
+            "timeout_ratio": timeout_count / max(1, len(ports_to_scan)),
+            "filtered_ratio": filtered_count / max(1, len(ports_to_scan)),
+            "closed_ratio": closed_count / max(1, len(ports_to_scan)),
+            "has_critical": any(f.risk_level == "CRITICAL" for f in open_findings),
+            "has_admin_port": bool(open_ports_set & self.UNEXPECTED_ADMIN_PORTS),
+            "has_db_port": bool(open_ports_set & self.DATABASE_PORTS),
+            "system_ports_count": len(system_ports),
+            "user_ports_count": len(user_ports),
+            "dynamic_ports_count": len(dynamic_ports),
+            "latency_p50": latency_p50,
+        })
+
+        if primary_port is not None:
+            service_info = PortKnowledgeBase.get_service(primary_port)
+            is_dangerous = service_info.risk_level in ["CRITICAL", "HIGH"]
+            encryption = PortKnowledgeBase.get_encryption(primary_port)
+            tcp_udp = PortKnowledgeBase.get_protocol(primary_port)
+            vulnerabilities = [
+                {"title": v.title, "cve": v.cve, "severity": v.severity}
+                for v in PortKnowledgeBase.get_vulnerabilities(primary_port)
+            ]
+            category = self._classify_port(primary_port)
+        else:
+            service_info = ServiceInfo(name="Unknown", description="", risk_level="LOW")
+            is_dangerous = False
+            encryption = None; tcp_udp = None
+            vulnerabilities = []; category = None
+
+        ctx.add_data_sync("primary_port", primary_port)
+        ctx.add_data_sync("service", service_info.name)
+        ctx.add_data_sync("description", service_info.description)
+        ctx.add_data_sync("is_dangerous", is_dangerous)
+        ctx.add_data_sync("encryption", encryption)
+        ctx.add_data_sync("tcp_udp", tcp_udp)
+        ctx.add_data_sync("category", category)
+        ctx.add_data_sync("risk_level", service_info.risk_level)
+        ctx.add_data_sync("risk_score", risk_score)
+        ctx.add_data_sync("security_score", security_score)
+        ctx.add_data_sync("vulnerabilities", vulnerabilities)
+        ctx.add_data_sync("vulnerabilities_count", len(vulnerabilities))
+
+        if is_dangerous and service_info.risk_level == "CRITICAL":
+            ctx.add_risk_signal_sync(RiskSignal.OPEN_PORT_CRITICAL)
+        elif is_dangerous and service_info.risk_level == "HIGH":
+            ctx.add_risk_signal_sync(RiskSignal.OPEN_PORT_HIGH)
+
         ctx.add_data_sync("analysis_confidence", 90)
         ctx.add_quality_signal_sync("port_check_completed")
 
@@ -12087,6 +12335,187 @@ def get_engine(tool: str) -> ScanEngine:
         }
         _ENGINES[tool] = engines[tool]() if tool in engines else create_url_engine()
     return _ENGINES[tool]
+    
+    
+@dataclass
+class ServiceInfo:
+    """معلومة خدمة منفذ - مستقلة تماماً"""
+    name: str
+    description: str
+    risk_level: str
+
+@dataclass
+class PortFinding:
+    """نتيجة فحص منفذ واحد"""
+    port: int
+    status: str
+    service: str
+    description: str
+    risk_level: str
+    latency_ms: float
+
+@dataclass
+class ConfidenceSignal:
+    """إشارة مع درجة ثقة - للاستخدام في ML/SIEM"""
+    signal: str
+    confidence: float
+    severity: str
+
+class PortKnowledgeBase:
+    """مكتبة معرفة المنافذ - مستقلة تماماً"""
+    
+    PORT_SERVICES = {
+        21: ("FTP", "File Transfer Protocol", "CRITICAL"),
+        22: ("SSH", "Secure Shell", "HIGH"),
+        23: ("Telnet", "Telnet - Unencrypted", "CRITICAL"),
+        25: ("SMTP", "Simple Mail Transfer Protocol", "MEDIUM"),
+        53: ("DNS", "Domain Name System", "MEDIUM"),
+        80: ("HTTP", "Hypertext Transfer Protocol", "LOW"),
+        110: ("POP3", "Post Office Protocol v3", "MEDIUM"),
+        143: ("IMAP", "Internet Message Access Protocol", "MEDIUM"),
+        443: ("HTTPS", "HTTP over SSL/TLS", "LOW"),
+        445: ("SMB", "Server Message Block", "CRITICAL"),
+        3306: ("MySQL", "MySQL Database", "HIGH"),
+        3389: ("RDP", "Remote Desktop Protocol", "CRITICAL"),
+        5432: ("PostgreSQL", "PostgreSQL Database", "HIGH"),
+        5900: ("VNC", "Virtual Network Computing", "HIGH"),
+        6379: ("Redis", "Redis Database", "HIGH"),
+        8080: ("HTTP-Alt", "HTTP Alternative", "LOW"),
+        8443: ("HTTPS-Alt", "HTTPS Alternative", "LOW"),
+        27017: ("MongoDB", "MongoDB Database", "HIGH"),
+    }
+    
+    COMMON_PORTS = list(PORT_SERVICES.keys())
+    
+    ENCRYPTED_PORTS = {22, 443, 465, 993, 995, 3389, 8443}
+    PLAINTEXT_PORTS = {21, 23, 25, 80, 110, 143, 8080}
+    
+    @dataclass
+    class VulnerabilityInfo:
+        title: str
+        cve: str
+        severity: str
+    
+    KNOWN_VULNERABILITIES = {
+        21: [
+            VulnerabilityInfo("Anonymous FTP access", "CVE-1999-0497", "CRITICAL"),
+            VulnerabilityInfo("FTP bounce attack", "CVE-1999-0017", "HIGH"),
+            VulnerabilityInfo("FTP brute force", "", "MEDIUM"),
+        ],
+        22: [
+            VulnerabilityInfo("SSH weak keys", "CVE-2008-0166", "HIGH"),
+            VulnerabilityInfo("SSH brute force", "", "MEDIUM"),
+            VulnerabilityInfo("SSH protocol downgrade", "CVE-2015-5600", "HIGH"),
+        ],
+        23: [
+            VulnerabilityInfo("Unencrypted communication", "", "CRITICAL"),
+            VulnerabilityInfo("Credential sniffing", "", "CRITICAL"),
+        ],
+        25: [
+            VulnerabilityInfo("Open relay abuse", "CVE-1999-0512", "HIGH"),
+            VulnerabilityInfo("SMTP injection", "CVE-2006-3747", "HIGH"),
+        ],
+        80: [
+            VulnerabilityInfo("Cross-Site Scripting (XSS)", "CVE-2020-11022", "HIGH"),
+            VulnerabilityInfo("SQL injection", "CVE-2019-11510", "CRITICAL"),
+        ],
+        443: [
+            VulnerabilityInfo("Heartbleed", "CVE-2014-0160", "CRITICAL"),
+            VulnerabilityInfo("POODLE", "CVE-2014-3566", "HIGH"),
+        ],
+        445: [
+            VulnerabilityInfo("EternalBlue", "CVE-2017-0144", "CRITICAL"),
+            VulnerabilityInfo("SMBGhost", "CVE-2020-0796", "CRITICAL"),
+        ],
+        3306: [
+            VulnerabilityInfo("MySQL auth bypass", "CVE-2012-2122", "CRITICAL"),
+        ],
+        3389: [
+            VulnerabilityInfo("BlueKeep", "CVE-2019-0708", "CRITICAL"),
+        ],
+        6379: [
+            VulnerabilityInfo("Redis unauthorized access", "CVE-2015-4335", "CRITICAL"),
+        ],
+    }
+    
+    SEVERITY_ORDER = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "info": 0}
+    
+    @classmethod
+    def get_service(cls, port: int) -> ServiceInfo:
+        name, desc, risk = cls.PORT_SERVICES.get(port, (f"Port {port}", "Unknown", "LOW"))
+        return ServiceInfo(name=name, description=desc, risk_level=risk)
+    
+    @classmethod
+    def get_encryption(cls, port: int) -> str:
+        if port in cls.ENCRYPTED_PORTS:
+            return "Encrypted"
+        if port in cls.PLAINTEXT_PORTS:
+            return "Plaintext"
+        return "Varies"
+    
+    @classmethod
+    def get_protocol(cls, port: int) -> str:
+        return "TCP/UDP" if port in {53, 67, 68, 123, 161, 162, 514} else "TCP"
+    
+    @classmethod
+    def get_vulnerabilities(cls, port: int) -> List[VulnerabilityInfo]:
+        return cls.KNOWN_VULNERABILITIES.get(port, [])
+
+
+class PortScanner:
+    """محرك فحص المنافذ - Batch Network Scanner"""
+    
+    def __init__(self, timeout_profile: str = "quick"):
+        timeouts = {"quick": 0.5, "deep": 1.0, "full": 2.0}
+        self.connection_timeout = timeouts.get(timeout_profile, 1.0)
+        self._semaphore = asyncio.Semaphore(300)
+    
+    async def scan_batch(self, addresses: list, ports: list) -> List[PortFinding]:
+        """فحص مجموعة منافذ - إرجاع قائمة النتائج"""
+        deadline = asyncio.get_running_loop().time() + 10.0
+        findings = []
+        
+        async def scan_single_port(port: int) -> PortFinding:
+            for ip in addresses:
+                result = await self._try_connect(ip, port, deadline)
+                if result and result.status == "open":
+                    return result
+            return PortFinding(port=port, status="filtered", service="UNKNOWN", description=f"Port {port}", risk_level="LOW", latency_ms=0)
+        
+        tasks = [asyncio.create_task(scan_single_port(p)) for p in ports]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for r in results:
+            if isinstance(r, PortFinding):
+                findings.append(r)
+        
+        return findings
+    
+    async def _try_connect(self, ip: str, port: int, deadline: float) -> Optional[PortFinding]:
+        async with self._semaphore:
+            try:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0.01:
+                    return PortFinding(port=port, status="timeout", service="UNKNOWN", description=f"Port {port}", risk_level="LOW", latency_ms=0)
+                
+                start = asyncio.get_running_loop().time()
+                _, writer = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=min(self.connection_timeout, remaining))
+                latency = (asyncio.get_running_loop().time() - start) * 1000
+                
+                service_info = PortKnowledgeBase.get_service(port)
+                writer.close()
+                with contextlib.suppress(Exception):
+                    await writer.wait_closed()
+                
+                return PortFinding(port=port, status="open", service=service_info.name, description=service_info.description, risk_level=service_info.risk_level, latency_ms=round(latency, 1))
+            except asyncio.TimeoutError:
+                return PortFinding(port=port, status="timeout", service="UNKNOWN", description=f"Port {port}", risk_level="LOW", latency_ms=0)
+            except ConnectionRefusedError:
+                return PortFinding(port=port, status="closed", service="UNKNOWN", description=f"Port {port}", risk_level="LOW", latency_ms=0)
+            except OSError:
+                return None
+            except Exception:
+                return PortFinding(port=port, status="unknown", service="UNKNOWN", description=f"Port {port}", risk_level="LOW", latency_ms=0)
 
 
 def scan_url(url: str) -> Dict:
@@ -12271,4 +12700,3 @@ async def test_async():
     print("✅ ORCHESTRATION ENGINE OPERATIONAL - ENTERPRISE SAAS EDITION")
     print("🏆 PRODUCTION HARDENED - COMMERCIAL GRADE")
     print("=" * 80 + "\n")
-print(f"DATA STRUCTURE: {scan_phone('+967773749784').keys()}")

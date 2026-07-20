@@ -1384,192 +1384,198 @@
     }
 
     // Display Results
-    function displayResults(data, email) {
-        const analysis = data.analysis || {};
-        const riskScore = data.risk_score || analysis.risk_score || 0;
-        const riskLevel = Utils.getRiskLevel(riskScore);
-        const riskColor = Utils.getRiskColor(riskScore);
-        const securityScore = analysis.security_score || (100 - riskScore);
-        const recommendations = generateRecommendations(analysis, riskScore);
-
-        let html = `
-            <div class="result-card-legendary">
-                <div class="result-header">
-                    <div>
-                        <span class="result-badge">${data.cached ? '⚡ من الذاكرة المؤقتة' : '✅ تحليل أسطوري مكتمل'}</span>
-                        <h3 class="result-title-large">
-                            <span class="result-icon-large">📧</span>
-                            نتيجة التحليل الأسطوري
-                        </h3>
-                    </div>
-                    <div style="background: ${riskColor}20; border: 1px solid ${riskColor}40; border-radius: 60px; padding: 12px 25px;">
-                        <span style="color: ${riskColor}; font-weight: 700; font-size: 1.1rem;">🛡️ ${riskLevel} (${securityScore}/100)</span>
-                    </div>
-                </div>
-
-                <!-- SECURITY SCORE METER -->
-                <div class="security-score-section">
-                    <div class="security-score-header">
-                        <span class="security-score-label">مستوى الأمان</span>
-                        <span class="security-score-value" style="color: ${riskColor};">${securityScore}%</span>
-                    </div>
-                    <div class="security-score-bar">
-                        <div class="security-score-fill" style="width: ${securityScore}%; background: ${riskColor};"></div>
-                    </div>
-                </div>
-
-                <!-- MAIN RESULTS GRID -->
-                <div class="results-grid">
-                    <div class="result-item-large">
-                        <span class="result-label-large">📧 البريد الإلكتروني</span>
-                        <span class="result-value-large">${email}</span>
-                    </div>
-                    <div class="result-item-large">
-                        <span class="result-label-large">✅ صيغة صحيحة</span>
-                        <span class="result-value-large ${analysis.valid_format ? 'success' : 'danger'}">${analysis.valid_format ? '✓ صحيح' : '✗ خاطئ'}</span>
-                    </div>
-                    <div class="result-item-large">
-                        <span class="result-label-large">🌐 النطاق</span>
-                        <span class="result-value-large info">${analysis.domain || 'غير معروف'}</span>
-                    </div>
-                    <div class="result-item-large">
-                        <span class="result-label-large">⚠️ بريد مؤقت</span>
-                        <span class="result-value-large ${analysis.is_disposable ? 'danger' : 'success'}">${analysis.is_disposable ? '🚨 نعم' : '✅ لا'}</span>
-                    </div>
-                    <div class="result-item-large">
-                        <span class="result-label-large">👥 بريد وظيفي</span>
-                        <span class="result-value-large ${analysis.is_role_based ? 'warning' : 'success'}">${analysis.is_role_based ? '⚠️ نعم' : '✅ لا'}</span>
-                    </div>
-                    <div class="result-item-large">
-                        <span class="result-label-large">🆓 مزود مجاني</span>
-                        <span class="result-value-large ${analysis.is_free_provider ? 'info' : ''}">${analysis.is_free_provider ? 'نعم' : 'لا'}</span>
-                    </div>
-                    <div class="result-item-large">
-                        <span class="result-label-large">📏 طول البريد</span>
-                        <span class="result-value-large">${analysis.length || 0} حرف</span>
-                    </div>
-                    <div class="result-item-large">
-                        <span class="result-label-large">📊 الإنتروبيا</span>
-                        <span class="result-value-large">${analysis.entropy ? analysis.entropy.toFixed(2) : '0.00'}</span>
-                    </div>
-                </div>
-
-                <!-- DNS RECORDS SECTION -->
-<div class="dns-section">
-    <div class="dns-header">
-        <span>🌐</span>
-        <h4>سجلات DNS والأمان</h4>
-    </div>
-    <div class="dns-grid">
-        <div class="dns-item">
-            <div class="dns-label">📡 MX Records</div>
-            <div class="dns-value ${analysis.has_mx ? 'success' : 'danger'}">${analysis.has_mx ? `✓ متاح (${analysis.mx_count || 0})` : '✗ غير متاح'}</div>
-        </div>
-        <div class="dns-item">
-            <div class="dns-label">🔐 SPF</div>
-            <div class="dns-value ${analysis.has_spf ? 'success' : 'warning'}">${analysis.has_spf ? '✓ متاح' : '✗ غير متاح'}</div>
-        </div>
-        <div class="dns-item">
-            <div class="dns-label">🛡️ DMARC</div>
-            <div class="dns-value ${analysis.has_dmarc ? 'success' : 'warning'}">${analysis.has_dmarc ? '✓ متاح' : '✗ غير متاح'}</div>
-        </div>
-        <div class="dns-item">
-            <div class="dns-label">✉️ DKIM</div>
-            <div class="dns-value ${analysis.has_dkim ? 'success' : 'warning'}">${analysis.has_dkim ? '✓ متاح' : '✗ غير متاح'}</div>
-        </div>
-        <div class="dns-item">
-            <div class="dns-label">🌍 A Record</div>
-            <div class="dns-value ${analysis.has_a ? 'success' : 'info'}">${analysis.has_a ? '✓ متاح' : '✗ غير متاح (طبيعي)'}</div>
-        </div>
-        <div class="dns-item">
-            <div class="dns-label">🌎 AAAA Record</div>
-            <div class="dns-value ${analysis.has_aaaa ? 'success' : 'info'}">${analysis.has_aaaa ? '✓ متاح' : '✗ غير متاح (طبيعي)'}</div>
-        </div>
-    </div>
-    ${analysis.mx_records && analysis.mx_records.length > 0 ? `
-    <div class="mx-records-list">
-        ${analysis.mx_records.map(mx => `<div class="mx-record-item">📧 ${mx}</div>`).join('')}
-    </div>
-    ` : ''}
-</div>
-
-                <!-- BREACH CHECK -->
-                ${analysis.is_breached ? `
-                <div class="breach-section">
-                    <div class="breach-header">
-                        <span>🚨</span>
-                        <h4>تحذير: بريد مخترق!</h4>
-                    </div>
-                    <div class="breach-list">
-                        ${analysis.breaches ? analysis.breaches.map(b => `
-                            <div class="breach-item">
-                                <span class="breach-name">🔥 ${b.name}</span>
-                                <span class="breach-date">📅 ${b.date}</span>
-                                <span class="breach-data">📊 ${b.data ? b.data.join(', ') : 'بيانات مسربة'}</span>
-                            </div>
-                        `).join('') : '<div class="breach-item"><span class="breach-name">تم اختراق هذا البريد في تسريبات سابقة</span></div>'}
-                    </div>
-                </div>
-                ` : ''}
-
-                <!-- RECOMMENDATIONS -->
-                <div class="recommendations-section">
-                    <h4 style="color: #c4b5fd; margin-bottom: 20px;">💡 توصيات ذكية</h4>
-                    ${recommendations.map(rec => `<div class="rec-item">🔹 ${rec}</div>`).join('')}
-                </div>
-
-                <!-- SIGNALS -->
-                ${analysis.signals && analysis.signals.length > 0 ? `
-                <div class="signals-section-large">
-                    <h4 class="signals-title-large">🔍 الإشارات الأمنية (${analysis.signals.length})</h4>
-                    <div class="signals-grid-large">
-                        ${analysis.signals.map(s => {
-                            let cls = 'signal-info';
-                            if (s.includes('SCAM') || s.includes('FAKE') || s.includes('BREACHED')) cls = 'signal-critical';
-                            else if (s.includes('SPAM') || s.includes('SUSPICIOUS') || s.includes('DISPOSABLE')) cls = 'signal-warning';
-                            else if (s.includes('VALID') || s.includes('SAFE')) cls = 'signal-success';
-                            return `<span class="signal-tag-large ${cls}">${s}</span>`;
-                        }).join('')}
-                    </div>
-                </div>
-                ` : ''}
-
-                <!-- AI INSIGHT -->
-                ${data.ai_risk_probability ? `
-                <div class="ai-insight-large">
-                    <div class="ai-title">
-                        <span>🧠</span>
-                        <h4>رؤية الذكاء الاصطناعي الأسطوري</h4>
-                    </div>
-                    <p class="ai-text">
-                        🧠 تحليل AI: ${analysis.valid_format ? '✅ البريد صحيح' : '❌ البريد غير صحيح'}.
-                        ${analysis.is_disposable ? '⚠️ هذا بريد مؤقت.' : ''}
-                        ${analysis.is_breached ? '🚨 تحذير: البريد مخترق!' : ''}
-                        ${analysis.has_spf ? '✅ SPF متاح.' : '⚠️ SPF غير متاح.'}
-                        ${analysis.has_dmarc ? '✅ DMARC متاح.' : '⚠️ DMARC غير متاح.'}
-                        مستوى الثقة: ${(data.ai_confidence * 100).toFixed(1)}%.
-                    </p>
-                </div>
-                ` : ''}
-
-                <!-- FOOTER -->
-                <div class="result-footer-large">
-                    <span>📌 الإدخال: <code style="background: rgba(0,0,0,0.3); padding: 5px 15px; border-radius: 20px;">${email}</code></span>
-                    <span>🕒 ${new Date().toLocaleString('ar-SA')}</span>
-                    <span>⚡ ${data.analysis_time_ms ? data.analysis_time_ms.toFixed(0) : '0'}ms</span>
-                </div>
-            </div>
-        `;
-
-        elements.result.innerHTML = html;
-        elements.result.classList.remove('hidden');
-        elements.error.classList.add('hidden');
-        elements.actionButtons.style.display = 'flex';
-
-        currentResult = data;
-        currentEmail = email;
-        addToHistory(email, data);
-    }
+	function displayResults(data, email) {
+	    const analysis = data.analysis || {};
+	    const riskScore = data.risk_score || analysis.risk_score || 0;
+	    const riskLevel = Utils.getRiskLevel(riskScore);
+	    const riskColor = Utils.getRiskColor(riskScore);
+	    
+	    // ✅ استخدام الحقول الصحيحة من المحرك الجديد
+	    const validFormat = analysis.valid_format || analysis.is_valid || false;
+	    const isDisposable = analysis.is_disposable || false;
+	    const isRoleBased = analysis.is_role_based || false;
+	    const isFreeProvider = analysis.is_free_provider || false;
+	    const securityScore = analysis.security_score || 100;
+	    const domain = analysis.domain || email.split('@')[1] || '';
+	    
+	    // ✅ DNS Records (من المحرك الجديد)
+	    const hasMX = analysis.has_mx_record || analysis.has_mx || false;
+	    const hasSPF = analysis.has_spf || false;
+	    const hasDMARC = analysis.has_dmarc || false;
+	    const hasDKIM = analysis.has_dkim || false;
+	    const hasA = analysis.has_a_record || false;
+	    const hasAAAA = analysis.has_aaaa_record || false;
+	    
+	    // ✅ Breach Check
+	    const isBreached = analysis.is_breached || false;
+	    const breaches = analysis.breaches || [];
+	    
+	    // ✅ Entropy
+	    const entropy = analysis.entropy || 0;
+	    
+	    // ✅ Recommendations
+	    const recommendations = generateRecommendations(analysis, riskScore);
+	
+	    let html = `
+	        <div class="result-card-legendary">
+	            <div class="result-header">
+	                <div>
+	                    <span class="result-badge">${data.cached ? '⚡ من الذاكرة المؤقتة' : '✅ تحليل أسطوري مكتمل'}</span>
+	                    <h3 class="result-title-large">
+	                        <span class="result-icon-large">📧</span>
+	                        نتيجة التحليل الأسطوري
+	                    </h3>
+	                </div>
+	                <div style="background: ${riskColor}20; border: 1px solid ${riskColor}40; border-radius: 60px; padding: 12px 25px;">
+	                    <span style="color: ${riskColor}; font-weight: 700; font-size: 1.1rem;">🛡️ ${riskLevel} (${securityScore}/100)</span>
+	                </div>
+	            </div>
+	
+	            <!-- SECURITY SCORE METER -->
+	            <div class="security-score-section">
+	                <div class="security-score-header">
+	                    <span class="security-score-label">مستوى الأمان</span>
+	                    <span class="security-score-value" style="color: ${riskColor};">${securityScore}%</span>
+	                </div>
+	                <div class="security-score-bar">
+	                    <div class="security-score-fill" style="width: ${securityScore}%; background: ${riskColor};"></div>
+	                </div>
+	            </div>
+	
+	            <!-- MAIN RESULTS GRID -->
+	            <div class="results-grid">
+	                <div class="result-item-large">
+	                    <span class="result-label-large">📧 البريد الإلكتروني</span>
+	                    <span class="result-value-large">${email}</span>
+	                </div>
+	                <div class="result-item-large">
+	                    <span class="result-label-large">✅ صيغة صحيحة</span>
+	                    <span class="result-value-large ${validFormat ? 'success' : 'danger'}">${validFormat ? '✓ صحيح' : '✗ خاطئ'}</span>
+	                </div>
+	                <div class="result-item-large">
+	                    <span class="result-label-large">🌐 النطاق</span>
+	                    <span class="result-value-large info">${domain}</span>
+	                </div>
+	                <div class="result-item-large">
+	                    <span class="result-label-large">⚠️ بريد مؤقت</span>
+	                    <span class="result-value-large ${isDisposable ? 'danger' : 'success'}">${isDisposable ? '🚨 نعم' : '✅ لا'}</span>
+	                </div>
+	                <div class="result-item-large">
+	                    <span class="result-label-large">👥 بريد وظيفي</span>
+	                    <span class="result-value-large ${isRoleBased ? 'warning' : 'success'}">${isRoleBased ? '⚠️ نعم' : '✅ لا'}</span>
+	                </div>
+	                <div class="result-item-large">
+	                    <span class="result-label-large">🆓 مزود مجاني</span>
+	                    <span class="result-value-large ${isFreeProvider ? 'info' : ''}">${isFreeProvider ? 'نعم' : 'لا'}</span>
+	                </div>
+	                <div class="result-item-large">
+	                    <span class="result-label-large">📏 طول البريد</span>
+	                    <span class="result-value-large">${analysis.length || 0} حرف</span>
+	                </div>
+	                <div class="result-item-large">
+	                    <span class="result-label-large">📊 الإنتروبيا</span>
+	                    <span class="result-value-large">${entropy ? entropy.toFixed(2) : '0.00'}</span>
+	                </div>
+	            </div>
+	
+	            <!-- DNS RECORDS SECTION -->
+	            <div class="dns-section">
+	                <div class="dns-header">
+	                    <span>🌐</span>
+	                    <h4>سجلات DNS والأمان</h4>
+	                </div>
+	                <div class="dns-grid">
+	                    <div class="dns-item">
+	                        <div class="dns-label">📡 MX Records</div>
+	                        <div class="dns-value ${hasMX ? 'success' : 'warning'}">${hasMX ? '✓ متاح' : '✗ غير متاح (طبيعي)'}</div>
+	                    </div>
+	                    <div class="dns-item">
+	                        <div class="dns-label">🔐 SPF</div>
+	                        <div class="dns-value ${hasSPF ? 'success' : 'warning'}">${hasSPF ? '✓ متاح' : '✗ غير متاح'}</div>
+	                    </div>
+	                    <div class="dns-item">
+	                        <div class="dns-label">🛡️ DMARC</div>
+	                        <div class="dns-value ${hasDMARC ? 'success' : 'warning'}">${hasDMARC ? '✓ متاح' : '✗ غير متاح'}</div>
+	                    </div>
+	                    <div class="dns-item">
+	                        <div class="dns-label">✉️ DKIM</div>
+	                        <div class="dns-value ${hasDKIM ? 'success' : 'warning'}">${hasDKIM ? '✓ متاح' : '✗ غير متاح'}</div>
+	                    </div>
+	                    <div class="dns-item">
+	                        <div class="dns-label">🌍 A Record</div>
+	                        <div class="dns-value ${hasA ? 'success' : 'info'}">${hasA ? '✓ متاح' : '✗ غير متاح (طبيعي)'}</div>
+	                    </div>
+	                    <div class="dns-item">
+	                        <div class="dns-label">🌎 AAAA Record</div>
+	                        <div class="dns-value ${hasAAAA ? 'success' : 'info'}">${hasAAAA ? '✓ متاح' : '✗ غير متاح (طبيعي)'}</div>
+	                    </div>
+	                </div>
+	                ${analysis.mx_records && analysis.mx_records.length > 0 ? `
+	                <div class="mx-records-list">
+	                    ${analysis.mx_records.map(mx => `<div class="mx-record-item">📧 ${mx}</div>`).join('')}
+	                </div>
+	                ` : ''}
+	            </div>
+	
+	            <!-- BREACH CHECK -->
+	            ${isBreached ? `
+	            <div class="breach-section">
+	                <div class="breach-header">
+	                    <span>🚨</span>
+	                    <h4>تحذير: بريد مخترق!</h4>
+	                </div>
+	                <div class="breach-list">
+	                    ${breaches.length > 0 ? breaches.map(b => `
+	                        <div class="breach-item">
+	                            <span class="breach-name">🔥 ${b.name}</span>
+	                            <span class="breach-date">📅 ${b.date}</span>
+	                            <span class="breach-data">📊 ${b.data ? b.data.join(', ') : 'بيانات مسربة'}</span>
+	                        </div>
+	                    `).join('') : '<div class="breach-item"><span class="breach-name">تم اختراق هذا البريد في تسريبات سابقة</span></div>'}
+	                </div>
+	            </div>
+	            ` : ''}
+	
+	            <!-- RECOMMENDATIONS -->
+	            <div class="recommendations-section">
+	                <h4 style="color: #c4b5fd; margin-bottom: 20px;">💡 توصيات ذكية</h4>
+	                ${recommendations.map(rec => `<div class="rec-item">🔹 ${rec}</div>`).join('')}
+	            </div>
+	
+	            <!-- SIGNALS -->
+	            ${analysis.signals && analysis.signals.length > 0 ? `
+	            <div class="signals-section-large">
+	                <h4 class="signals-title-large">🔍 الإشارات الأمنية (${analysis.signals.length})</h4>
+	                <div class="signals-grid-large">
+	                    ${analysis.signals.map(s => {
+	                        let cls = 'signal-info';
+	                        if (s.includes('SCAM') || s.includes('FAKE') || s.includes('BREACHED')) cls = 'signal-critical';
+	                        else if (s.includes('SPAM') || s.includes('SUSPICIOUS') || s.includes('DISPOSABLE')) cls = 'signal-warning';
+	                        else if (s.includes('VALID') || s.includes('SAFE')) cls = 'signal-success';
+	                        return `<span class="signal-tag-large ${cls}">${s}</span>`;
+	                    }).join('')}
+	                </div>
+	            </div>
+	            ` : ''}
+	
+	            <!-- FOOTER -->
+	            <div class="result-footer-large">
+	                <span>📌 الإدخال: <code style="background: rgba(0,0,0,0.3); padding: 5px 15px; border-radius: 20px;">${email}</code></span>
+	                <span>🕒 ${new Date().toLocaleString('ar-SA')}</span>
+	                <span>⚡ ${data.analysis_time_ms ? data.analysis_time_ms.toFixed(0) : '0'}ms</span>
+	            </div>
+	        </div>
+	    `;
+	
+	    elements.result.innerHTML = html;
+	    elements.result.classList.remove('hidden');
+	    elements.error.classList.add('hidden');
+	    elements.actionButtons.style.display = 'flex';
+	
+	    currentResult = data;
+	    currentEmail = email;
+	    addToHistory(email, data);
+	}
 
     function showError(message) {
         if (elements.errorMessage) elements.errorMessage.textContent = message;
